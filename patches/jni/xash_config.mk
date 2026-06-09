@@ -1,0 +1,4 @@
+NANOGL_PATH := $(LOCAL_PATH)/../jni/nanogl
+XASH_SINGLE_BINARY := 0
+XASH_BUILD_ENGINE  := 1
+XASH_NANOGL        := 1
