@@ -1,0 +1,149 @@
+name: Build xash3d Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: patch-repo
+
+    - name: Clone tyabus/xash3d
+      run: |
+        git clone --depth=1 https://github.com/tyabus/xash3d.git engine
+
+    - name: Clone xash3d-android-project (has correct NanoGL submodule)
+      run: |
+        git clone --recurse-submodules --depth=1 \
+          https://github.com/FWGS/xash3d-android-project.git android-project
+        NANOGL=$(find android-project -type d -name "nanogl" | head -1)
+        echo "NANOGL_PATH=$NANOGL" >> $GITHUB_ENV
+        echo "NanoGL: $NANOGL"
+
+    - name: Copy new source files into engine
+      run: |
+        cp patch-repo/patches/engine/common/masterlist.c   engine/engine/common/masterlist.c
+        cp patch-repo/patches/engine/client/cl_serverlist.c engine/engine/client/cl_serverlist.c
+        cp patch-repo/patches/engine/client/cl_serverlist.h engine/engine/client/cl_serverlist.h
+        echo "Files copied."
+
+    - name: Apply engine patches
+      run: python3 patch-repo/patch_engine.py engine
+
+    - name: Verify patches
+      run: |
+        grep -q "NET_MasterQuery"           engine/engine/common/common.h    && echo "common.h OK"
+        grep -q "internetservers_key"       engine/engine/client/client.h    && echo "client.h OK"
+        grep -q "CL_ParseGoldSrcStatus"     engine/engine/client/cl_main.c   && echo "cl_main.c OK"
+        grep -q "cl_serverlist.c"           engine/engine/Android.mk          && echo "Android.mk OK"
+
+    - name: Setup Java 11
+      uses: actions/setup-java@v4
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install NDK r21e
+      run: |
+        sdkmanager --install "ndk;21.4.7075529"
+        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/21.4.7075529" >> $GITHUB_ENV
+
+    - name: Prepare jni directory
+      run: |
+        mkdir -p engine/jni
+        cp -r "$NANOGL_PATH" engine/jni/nanogl
+
+        # Generate XASH3D_CONFIG
+        cat > engine/jni/xash_config.mk << 'CFG'
+        NANOGL_PATH := $(LOCAL_PATH)/../jni/nanogl
+        XASH_SINGLE_BINARY := 0
+        XASH_BUILD_ENGINE  := 1
+        XASH_NANOGL        := 1
+        CFG
+
+        # Application.mk
+        cat > engine/jni/Application.mk << 'APP'
+        APP_ABI      := armeabi-v7a arm64-v8a
+        APP_PLATFORM := android-21
+        APP_STL      := c++_static
+        APP_OPTIM    := release
+        APP_CFLAGS   := -O2 -w -DANDROID -DXASH_NANOGL -DUSE_EVDEV -DXASH_OPENSL
+        APP'
+
+        # Point XASH3D_CONFIG from engine/Android.mk
+        sed -i 's|include $(XASH3D_CONFIG)|include $(LOCAL_PATH)/../jni/xash_config.mk|' \
+          engine/engine/Android.mk
+
+    - name: Build native library
+      working-directory: engine
+      run: |
+        $ANDROID_NDK_HOME/ndk-build \
+          NDK_PROJECT_PATH=. \
+          APP_BUILD_SCRIPT=engine/Android.mk \
+          NDK_APPLICATION_MK=jni/Application.mk \
+          APP_ABI="armeabi-v7a arm64-v8a" \
+          -j$(nproc) 2>&1 | tee ../ndk_build.log
+        find libs/ -name "*.so" | sort
+
+    - name: Package APK
+      run: |
+        mkdir -p apk-wrap/app/src/main
+        cp -r patch-repo/patches/android/app/src/main/AndroidManifest.xml apk-wrap/app/src/main/
+        cp -r patch-repo/patches/android/app/src/main/java  apk-wrap/app/src/main/
+        cp -r patch-repo/patches/android/app/src/main/res   apk-wrap/app/src/main/
+
+        for ABI in armeabi-v7a arm64-v8a; do
+          if [ -d "engine/libs/$ABI" ]; then
+            mkdir -p "apk-wrap/app/src/main/jniLibs/$ABI"
+            cp engine/libs/$ABI/*.so apk-wrap/app/src/main/jniLibs/$ABI/
+          fi
+        done
+
+        cp patch-repo/patches/android/build.gradle.kts    apk-wrap/
+        cp patch-repo/patches/android/settings.gradle.kts apk-wrap/
+        cp patch-repo/patches/android/gradle.properties   apk-wrap/
+
+        # app build.gradle without NDK build (libs already compiled)
+        cat > apk-wrap/app/build.gradle.kts << 'GRADLE'
+        plugins { id("com.android.application") }
+        android {
+            namespace = "su.xash.engine"; compileSdk = 33
+            defaultConfig {
+                applicationId = "su.xash.engine"
+                minSdk = 21; targetSdk = 33
+                versionCode = 1; versionName = "1.0-net"
+            }
+            buildTypes { release { isMinifyEnabled = false
+                signingConfig = signingConfigs.getByName("debug") } }
+            sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+            packaging { jniLibs.useLegacyPackaging = true }
+        }
+        GRADLE
+
+        cd apk-wrap && gradle wrapper --gradle-version=8.4
+        chmod +x gradlew
+        ./gradlew assembleRelease --no-daemon
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: xash3d-net-android
+        path: apk-wrap/app/build/outputs/apk/release/*.apk
+        if-no-files-found: error
+
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: ndk_build.log
